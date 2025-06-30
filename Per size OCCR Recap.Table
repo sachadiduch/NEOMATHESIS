@@ -1,0 +1,181 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+# === 1. Historical Credit Score ===
+def calculate_historical_credit_score(excel_path,
+                                      sheet_name=0,
+                                      date_format="%d/%m/%Y",
+                                      skip_header_lines=1):
+    df = pd.read_excel(excel_path, sheet_name=sheet_name, skiprows=skip_header_lines, header=0)
+    today = datetime.today()
+    df['MaturityDate']   = pd.to_datetime(df['Maturity'], format=date_format, dayfirst=True)
+    df['YearsRemaining'] = (df['MaturityDate'] - today).dt.days / 365
+    df['HCS']            = 1 - (1 - df['PD1Y']) ** df['YearsRemaining']
+    df['Weight']         = df['Amt Out'] / df['Amt Out'].sum()
+    return (df['Weight'] * df['HCS']).sum()
+
+# === 2. Current Credit Score ===
+def calculate_current_credit_score(ev, total_debt, n_simulations=10000):
+    np.random.seed(42)
+    shocks      = np.random.normal(loc=-0.45, scale=0.15, size=n_simulations)
+    shocks      = np.clip(shocks, -0.80, -0.10)
+    stressed_ev = ev * (1 + shocks)
+    # Probability that stressed EV falls below total debt
+    return np.mean(stressed_ev < total_debt)
+
+# === 3. Credit Utilization Score ===
+def compute_credit_utilization_score(ebitda, total_debt, max_leverage):
+    raw_score = 1 - (total_debt / (ebitda * max_leverage))
+    # Clamp between 0 and 1
+    return max(0.0, min(1.0, round(raw_score, 5)))
+
+# === 4. Transaction Score ===
+def calculate_transaction_score(cfo_list):
+    arr     = np.array(cfo_list, dtype=float)
+    # Linearly increasing weights from 0.2 to 1.0
+    weights = np.linspace(0.2, 1.0, len(arr))
+    weighted = arr * weights
+    denom   = np.abs(arr).sum()
+    return weighted.sum() / denom if denom else 0.0
+
+# === 5a. Extract Dates & Amounts ===
+def extract_dates_and_amounts(path):
+    df = pd.read_excel(path, skiprows=1)[['Issue Date', 'Amt Out']].dropna()
+    # Parse issue dates
+    df['Issue Date'] = pd.to_datetime(df['Issue Date'], dayfirst=True, errors='coerce')
+    df = df.dropna(subset=['Issue Date']).sort_values('Issue Date')
+    dates = df['Issue Date'].dt.strftime("%Y-%m-%d").tolist()
+    amounts = df['Amt Out'].astype(float).tolist()
+    return dates, amounts
+
+# === 5b. New Credit Score ===
+def calculate_new_credit_score(dates, amounts):
+    # Convert date strings to datetime objects
+    date_objs = [datetime.strptime(d, "%Y-%m-%d") for d in dates]
+    # Compute day-to-day deltas
+    deltas    = [(date_objs[i] - date_objs[i-1]).days for i in range(1, len(date_objs))] if len(date_objs) > 1 else []
+    avg_delta = sum(deltas) / len(deltas) if deltas else 0
+    avg_amount = np.mean(amounts) if amounts else 0
+    # Flag as 1 when amount >= average AND interval <= average
+    flags = [1 if (amounts[i] >= avg_amount and deltas[i-1] <= avg_delta) else 0 for i in range(1, len(amounts))]
+    return sum(flags) / len(flags) if flags else 0.0
+
+# === Raw OCCR Score ===
+def compute_raw_occr(hcs, current_cs, utilization, transaction, new_cs):
+    return 0.35*hcs + 0.25*current_cs + 0.15*utilization - 0.15*transaction + 0.10*new_cs
+
+# === Votre configuration de sociétés ===
+COMPANIES = [
+    {"ticker": "AAPL",   "enterprise": "Apple",                 "sector": "Technology",
+     "excel_path": "/Users/sacha/Desktop/NEOMA/DISSERTATION/Research/Firms/OCCR AAPL.xlsx",
+     "ev": 2_577_395_300_000, "total_debt": 85_068_400_000,  "ebitda": 116_670_300_000, "max_leverage": 1.5,
+     "cfo_list": [19_658_600_000, 25_002_600_000, 23_229_100_000, 25_935_700_000, 20_752_500_000]},
+    {"ticker": "NVDA",   "enterprise": "NVIDIA",               "sector": "Technology",
+     "excel_path": "/Users/sacha/Desktop/NEOMA/DISSERTATION/Research/Firms/OCCR NVDA.xlsx",
+     "ev": 3_010_169_900_000, "total_debt": 8_910_000_000,   "ebitda": 72_185_800_000,  "max_leverage": 1.5,
+     "cfo_list": [13_294_900_000, 12_552_400_000, 15_272_000_000, 14_407_400_000, 23_751_500_000]},
+    {"ticker": "SAP",    "enterprise": "SAP",                  "sector": "Technology",
+     "excel_path": "/Users/sacha/Desktop/NEOMA/DISSERTATION/Research/Firms/OCCR SAP.xlsx",
+     "ev": 289_086_000_000,   "total_debt": 10_107_000_000,  "ebitda": 8_914_000_000,   "max_leverage": 2.0,
+     "cfo_list": [2_878_000_000, 1_540_000_000, 1_475_000_000, -552_000_000, 3_780_000_000]},
+    {"ticker": "STLAM",  "enterprise": "Stellantis",           "sector": "Automotive",
+     "excel_path": "/Users/sacha/Desktop/NEOMA/DISSERTATION/Research/Firms/OCCR STLAP.xlsx",
+     "ev": 25_354_600_000,    "total_debt": 37_251_000_000,  "ebitda": 10_696_000_000,  "max_leverage": 2.5,
+     "cfo_list": [4_546_000_000, 2_444_500_000, 2_444_500_000, -440_500_000, -440_500_000]},
+    {"ticker": "VOW3",   "enterprise": "Volkswagen",           "sector": "Automotive",
+     "excel_path": "/Users/sacha/Desktop/NEOMA/DISSERTATION/Research/Firms/OCCR VOW3.xlsx",
+     "ev": 261_774_900_000,   "total_debt": 252_054_000_000, "ebitda": 33_969_000_000,  "max_leverage": 3.0,
+     "cfo_list": [1_766_000_000, 2_721_000_000, 7_339_000_000, 5_325_000_000, 2_976_000_000]},
+    {"ticker": "F",      "enterprise": "Ford",                 "sector": "Automotive",
+     "excel_path": "/Users/sacha/Desktop/NEOMA/DISSERTATION/Research/Firms/OCCR F.xlsx",
+     "ev": 150_374_000_000,   "total_debt": 136_703_000_000, "ebitda": 9_588_400_000,   "max_leverage": 3.0,
+     "cfo_list": [1_200_000_000, 4_772_100_000, 4_766_900_000, 2_623_500_000, 3_187_500_000]},
+    {"ticker": "EMEIS",  "enterprise": "EMEIS (ex-Orpea)",      "sector": "Healthcare",
+     "excel_path": "/Users/sacha/Desktop/NEOMA/DISSERTATION/Research/Firms/OCCR EMEIS.xlsx",
+     "ev": 10_032_100_000,    "total_debt": 8_858_400_000,   "ebitda": 81_100_000,      "max_leverage": 3.0,
+     "cfo_list": [86_900_000, 82_300_000, 82_300_000, 153_700_000, 153_700_000]},
+    {"ticker": "CLARI",  "enterprise": "Clariane",            "sector": "Healthcare",
+     "excel_path": "/Users/sacha/Desktop/NEOMA/DISSERTATION/Research/Firms/OCCR CLARI.xlsx",
+     "ev": 9_370_600_000,     "total_debt": 7_983_700_000,   "ebitda": 632_100_000,     "max_leverage": 3.25,
+     "cfo_list": [250_900_000, 217_200_000, 217_100_000, 233_000_000, 233_000_000]},
+    {"ticker": "UHS",    "enterprise": "Universal Health Serv.","sector": "Healthcare",
+     "excel_path": "/Users/sacha/Desktop/NEOMA/DISSERTATION/Research/Firms/OCCR UHS.xlsx",
+     "ev": 14_078_300_000,    "total_debt": 4_413_600_000,   "ebitda": 1_966_600_000,   "max_leverage": 2.5,
+     "cfo_list": [343_400_000, 588_500_000, 288_500_000, 570_500_000, 311_900_000]},
+    {"ticker": "ENGI",   "enterprise": "Engie",               "sector": "Utilities",
+     "excel_path": "/Users/sacha/Desktop/NEOMA/DISSERTATION/Research/Firms/OCCR ENGI.xlsx",
+     "ev": 89_477_000_000,    "total_debt": 52_438_100_000,  "ebitda": 13_516_200_000,  "max_leverage": 4.0,
+     "cfo_list": [17_967_500_000, 4_487_000_000, 4_487_000_000, 2_085_000_000, 2_085_000_000]},
+    {"ticker": "IBE.MC","enterprise": "Iberdrola",           "sector": "Utilities",
+     "excel_path": "/Users/sacha/Desktop/NEOMA/DISSERTATION/Research/Firms/OCCR IBE.xlsx",
+     "ev": 175_771_600_000,   "total_debt": 60_084_000_000,  "ebitda": 16_563_000_000,  "max_leverage": 4.0,
+     "cfo_list": [3_145_000_000, 2_995_000_000, 2_995_000_000, 2_995_000_000, 3_502_000_000]},
+    {"ticker": "NG.L",   "enterprise": "National Grid",       "sector": "Utilities",
+     "excel_path": "/Users/sacha/Desktop/NEOMA/DISSERTATION/Research/Firms/OCCR NG.xlsx",
+     "ev": 110_609_700_000,   "total_debt": 56_939_200_000,  "ebitda": 6_831_300_000,   "max_leverage": 4.25,
+     "cfo_list": [2_385_100_000, 1_527_700_000, 1_527_700_000, 2_454_100_000, 2_454_100_000]},
+]
+
+
+if __name__ == "__main__":
+    results = []
+    for comp in COMPANIES:
+        hcs    = calculate_historical_credit_score(comp["excel_path"])
+        curr   = calculate_current_credit_score(comp["ev"], comp["total_debt"])
+        util   = compute_credit_utilization_score(comp["ebitda"], comp["total_debt"], comp["max_leverage"])
+        trans  = calculate_transaction_score(comp["cfo_list"])
+        dates, amts = extract_dates_and_amounts(comp["excel_path"])
+        newc   = calculate_new_credit_score(dates, amts)
+        raw    = compute_raw_occr(hcs, curr, util, trans, newc)
+        results.append({
+            "Sector": comp["sector"],
+            "Ticker": comp["ticker"],
+            "Enterprise": comp["enterprise"],
+            "EV": comp["ev"],
+            "RawOCCR": round(raw, 5)
+        })
+
+    df = pd.DataFrame(results)
+
+    # ==== Calculating EV Quartiles ====
+    quartiles = df['EV'].quantile([0.25, 0.5, 0.75])
+    Q1 = quartiles.loc[0.25]
+    Q2 = quartiles.loc[0.5]
+    Q3 = quartiles.loc[0.75]
+    print(f"EV Quartiles (in € billions): Q1 = {Q1/1e9:.2f}, Q2 = {Q2/1e9:.2f}, Q3 = {Q3/1e9:.2f}\n")
+
+    # ==== Assigning quartile groups with labels ====
+    bins   = [-np.inf, Q1, Q2, Q3, np.inf]
+    labels = ['Q1 (Small Cap)', 'Q2 (Mid Cap)', 'Q3 (Large Cap)', 'Q4 (Mega Cap)']
+    df['Quartile Group'] = pd.cut(df['EV'], bins=bins, labels=labels)
+
+    # ==== Average RawOCCR and NormOCCR by quartile ====
+    df['NormOCCR'] = ((df['RawOCCR'] - df['RawOCCR'].min()) / (df['RawOCCR'].max() - df['RawOCCR'].min())).round(5)
+    print("=== Average RawOCCR and NormOCCR by EV Quartile ===")
+    print(df.groupby('Quartile Group')[['RawOCCR','NormOCCR']].mean().round(5), "\n")
+
+    # ==== Detailed companies table by quartile ====
+    detail = df.set_index(['Quartile Group','Ticker','Enterprise'])[['EV','RawOCCR','NormOCCR']]
+    print("=== Detailed Companies by EV Quartile ===")
+    print(detail.to_string(formatters={'EV':'{:,.0f}'.format}))
+    
+
+    # ==== Plot Normalized OCCR for Each Company with Quartile Lines ====
+    plot_df = df.sort_values('NormOCCR')
+    norm_quartiles = plot_df['NormOCCR'].quantile([0.25, 0.5, 0.75])
+    nQ1, nQ2, nQ3 = norm_quartiles.loc[0.25], norm_quartiles.loc[0.5], norm_quartiles.loc[0.75]
+
+    plt.figure()
+    plt.scatter(plot_df['NormOCCR'], plot_df['Ticker'])
+    # Plot vertical lines for quartiles
+    for idx, q in enumerate([nQ1, nQ2, nQ3], start=1):
+        plt.axvline(q, color='gray', linestyle='--', linewidth=1)
+        plt.text(q, -0.5, f'Q{idx}: {q:.2f}', rotation=90, va='bottom', ha='right')
+
+    plt.xlabel('Normalized OCCR (0 to 1)')
+    plt.ylabel('Company Ticker')
+    plt.title('Normalized OCCR for Each Company with Quartile Thresholds')
+    plt.grid(True)
+    plt.show()
