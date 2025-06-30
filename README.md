@@ -1,2 +1,2 @@
 # NEOMATHESIS
-Python Scripts &amp; execl files
+Python Scripts &amp; excel files
