@@ -1,0 +1,271 @@
+# === OCCR Centralized Credit Risk Score Model ===
+
+# Section 1: Imports
+try:
+    import pandas as pd
+    import numpy as np
+    import matplotlib.pyplot as plt
+except ImportError as exc:
+    missing = str(exc).split()[-1].strip("'")
+    raise SystemExit(f"Missing required package: {missing}. Install dependencies with 'pip install -r requirements.txt'.")
+from datetime import datetime
+
+#1: Historical Credit Score
+def calculate_historical_credit_score(excel_path, sheet_name=0, date_format="%d/%m/%Y", skip_header_lines=1):
+    df = pd.read_excel(excel_path, sheet_name=sheet_name, skiprows=skip_header_lines, header=0)
+    for col in ['Amt Out', 'PD1Y', 'Maturity']:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+    today = datetime.today()
+    df['MaturityDate'] = pd.to_datetime(df['Maturity'], format=date_format, dayfirst=True)
+    df['YearsRemaining'] = (df['MaturityDate'] - today).dt.days / 365
+    df['HCS'] = 1 - (1 - df['PD1Y']) ** df['YearsRemaining']
+    df['Weight'] = df['Amt Out'] / df['Amt Out'].sum()
+    return (df['Weight'] * df['HCS']).sum()
+
+#2: Current Credit Score
+def calculate_current_credit_score(enterprise_value, total_debt, n_simulations=10000, plot=False):
+    min_stress, max_stress = 0.10, 0.80
+    np.random.seed(42)
+    raw_stress = np.random.normal(loc=-0.45, scale=0.15, size=n_simulations)
+    bounded_stress = np.clip(raw_stress, -max_stress, -min_stress)
+    stressed_ev = enterprise_value * (1 + bounded_stress)
+    credit_score = np.sum(stressed_ev < total_debt) / n_simulations
+
+    if plot:
+        plt.figure(figsize=(10, 5))
+        plt.hist(stressed_ev, bins=50, color='salmon', edgecolor='black')
+        plt.axvline(total_debt, color='blue', linestyle='--', label=f'Total Debt (€{total_debt:,.0f})')
+        plt.title(r'$\bf{Current\ Credit\ Score}$' + '\nDistribution of Stressed Enterprise Value\n(Normal Distribution, Stress Between -10% and -80%)')
+        plt.xlabel('Stressed Enterprise Value (€)')
+        plt.ylabel('Frequency')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+    return credit_score
+
+
+#3: Credit Utilization Score
+def compute_credit_utilization_score(ebitda, total_debt, max_leverage=2.0, penalty_slope=0.2):
+    if ebitda <= 0 or max_leverage <= 0:
+        raise ValueError("EBITDA and max_leverage must be positive.")
+    
+    ratio = total_debt / (ebitda * max_leverage)
+
+    if ratio <= 1:
+        score = 1 - ratio
+    else:
+        score = (1 - ratio) - penalty_slope * (ratio - 1)
+
+    score = round(score, 5)  # Autoriser les valeurs négatives ici
+    return score
+
+
+#4: On-chain transaction score
+import numpy as np
+
+def calculate_transaction_score(cfo_list, weights=None):
+    """
+    Calculate the Transaction Score (3.4) using operating cash flow history.
+
+    Parameters:
+    - cfo_list: list of operating cash flows (ordered from oldest to most recent)
+    - weights: optional list of recency weights (same length as cfo_list).
+               If None, default weights increase linearly with recency.
+
+    Returns:
+    - score: float between -1 and 1 (positive = net inflows, negative = net outflows)
+    """
+    cfo_array = np.array(cfo_list, dtype=float)
+
+    if weights is None:
+        # Default: recency weights from 0.2 (oldest) to 1.0 (most recent)
+        weights = np.linspace(0.2, 1.0, len(cfo_array))
+
+    weights = np.array(weights, dtype=float)
+    weighted_product = cfo_array * weights
+    abs_total = np.sum(np.abs(cfo_array))
+    weighted_sum = np.sum(weighted_product)
+
+    score = 0.0 if abs_total == 0 else weighted_sum / abs_total
+
+    df = pd.DataFrame({
+        "Quarter": [f"Q{i+1}" for i in range(len(cfo_array))],
+        "Operating Cash Flow (B€)": cfo_array / 1_000_000_000,
+        "Weight": weights,
+        "Weighted Flow (B€)": weighted_product / 1_000_000_000
+    })
+
+    return score, df
+
+#5: New credit score
+def extract_dates_and_amounts(excel_path, date_column='Issue Date', amount_column='Amt Out',
+                              date_format="%d/%m/%Y", skip_header_lines=1):
+    df = pd.read_excel(excel_path, skiprows=skip_header_lines)
+    df = df[[date_column, amount_column]].dropna()
+    df[date_column] = pd.to_datetime(df[date_column], format=date_format, errors='coerce')
+    df = df.dropna(subset=[date_column])
+    df = df.sort_values(by=date_column)
+    dates = df[date_column].dt.strftime("%Y-%m-%d").tolist()
+    amounts = df[amount_column].astype(float).tolist()
+    return dates, amounts
+
+def calculate_new_credit_score(dates, amounts):
+    if len(dates) != len(amounts):
+        raise ValueError("dates and amounts must have the same length.")
+    date_objs = [datetime.strptime(d, "%Y-%m-%d") for d in dates]
+    sorted_data = sorted(zip(date_objs, amounts), key=lambda x: x[0])
+    sorted_dates, sorted_amounts = zip(*sorted_data)
+    avg_amount = np.mean(sorted_amounts)
+    delta_days = np.diff(sorted_dates)
+    delta_days = np.array([d.days for d in delta_days])
+    avg_delta = np.mean(delta_days)
+    flags = []
+    for i in range(1, len(sorted_amounts)):
+        is_large = sorted_amounts[i] >= avg_amount
+        is_close = delta_days[i - 1] <= avg_delta
+        flags.append(1 if is_large and is_close else 0)
+    score = sum(flags) / len(flags) if flags else 0.0
+    df = pd.DataFrame({
+        "Date": [d.strftime("%Y-%m-%d") for d in sorted_dates],
+        "Amount (€)": sorted_amounts,
+        "Days Since Previous": [None] + delta_days.tolist(),
+        "Above Avg Amount": [None] + [amt >= avg_amount for amt in sorted_amounts[1:]],
+        "Short Interval": [None] + [d <= avg_delta for d in delta_days],
+        "Flagged Risky": [None] + flags
+    })
+    return score, df
+
+# FINAL COMBINATION: OCCR SCORE
+def compute_occr_score(hcs, current_score, utilization_score,  transaction_score, new_credit_score):
+    return (
+        0.35 * hcs +
+        0.25 * current_score +
+        0.15 * utilization_score -
+        0.15 *  transaction_score +
+        0.10 * new_credit_score
+    )
+
+#Interpretation
+def interpret_occr_score(occr_score, hcs, current_score, utilization_score, scti, snci):
+    interpretation = f"""
+The final OCCR Score of {occr_score:.5f} reflects a composite assessment of the company’s credit risk across historical, structural, and behavioral dimensions. This value is interpreted as {"very low overall risk and strong financial resilience" if occr_score < 0.10 else "moderate risk with specific financial signals requiring monitoring" if occr_score < 0.25 else "heightened credit risk and potential vulnerabilities in the financial profile"}.
+
+• Historical Credit Score (HCS): {hcs:.5f}
+This reflects the maturity-weighted probability of default across existing debt instruments. The score indicates {"negligible long-term default risk and high credit reliability" if hcs < 0.05 else "a concerning profile of long-term credit risk or significant default exposure"}.
+
+• Current Credit Score: {current_score:.5f} → ~{current_score:.2%} stress-default probability
+This simulates insolvency risk under stressed enterprise valuations. The score suggests {"strong valuation buffers under stress conditions" if current_score < 0.10 else "possible vulnerability to adverse valuation scenarios" if current_score < 0.25 else "material insolvency risk in stressed market environments"}.
+
+• Credit Utilization Score: {utilization_score:.5f}
+This indicates that the firm is using approximately {(1 - utilization_score):.2%} of its allowable leverage capacity. {"A high score here implies prudent use of leverage and ample financial flexibility." if utilization_score > 0.6 else "A lower score suggests substantial use of available debt capacity, potentially reducing financial agility."}
+
+• Transaction Score (CFO behavior): {scti:.5f}
+Based on recent operating cash flows weighted by recency, this score captures financial behavior. The value suggests {"strong and consistent inflows" if scti > 0.6 else "mixed or fluctuating cash flow performance" if scti > 0.4 else "weakened cash flow dynamics or irregular earnings patterns"}.
+
+• New Credit Score (SNCI): {snci:.5f}
+Approximately {snci:.2%} of recent credit events were flagged as both large and closely spaced. This indicates {"a conservative and controlled credit strategy" if snci < 0.3 else "moderate activity with some clustering of credit events" if snci < 0.6 else "an aggressive or risky credit expansion trend that may warrant attention"}.
+
+Together, these elements form a multidimensional view of the entity’s creditworthiness. The OCCR framework integrates both forward-looking risk (via simulation and behavior) and structural fundamentals (via utilization and history), offering a robust lens for assessing credit quality.
+"""
+    return interpretation
+
+
+# Example Execution
+if __name__ == "__main__":
+    # === Example inputs ===
+    excel_path = "/Users/sacha/Desktop/NEOMA/DISSERTATION/Research/Firms/OCCR CLARI.xlsx"
+
+    # === 3.1: Historical Credit Score
+    hcs = calculate_historical_credit_score(excel_path)
+
+    # === 3.2: Current Credit Score
+    enterprise_value=9_370_600_000
+    total_debt=7_983_700_000
+    
+    current_score = calculate_current_credit_score(
+        enterprise_value=enterprise_value,
+        total_debt=total_debt,
+        plot=False
+    )
+
+    # === 3.3: Credit Utilization Score
+    ebitda =632_100_000
+    max_leverage = 3.25
+
+    raw_utilization_score = compute_credit_utilization_score(
+        ebitda=ebitda,
+        total_debt=total_debt,
+        max_leverage=max_leverage)
+    utilization_score = max(0.0, raw_utilization_score)
+
+    # === 3.4: Transaction Score
+    cfo_list = [250_900_000, 217_200_000, 217_100_000, 233_000_000,233_000_000]#Quaterly
+    scti, transaction_table = calculate_transaction_score(cfo_list)
+
+    # === 3.5: New Credit Score
+    dates, amounts = extract_dates_and_amounts(excel_path)
+    snci, snci_table = calculate_new_credit_score(dates, amounts)
+
+    # === Final OCCR Score
+    occr_score = compute_occr_score(hcs, current_score, utilization_score, scti, snci)
+
+    # === Display Results ===
+    print(f"Historical Credit Score: {hcs:.5f}")
+    print(f"Based on outstanding exposures and their maturity-adjusted default probabilities, the portfolio is expected to experience a cumulative default rate of {hcs:.2%} over its remaining life.")
+
+    print(f"\nCurrent Credit Score: {current_score:.5f}")
+    print(f"The company is at risk of insolvency in approximately {current_score:.2%} of stressed market scenarios.")
+    # === Plot Current Credit Score again before printing ===
+    _ = calculate_current_credit_score(
+    enterprise_value=enterprise_value,total_debt=total_debt,plot=True)
+
+
+    print(f"\nCredit Utilization Score: {raw_utilization_score:.5f}")
+    if raw_utilization_score >= 0:
+        print(f"The company is using approximately {(1 - raw_utilization_score):.2%} of its borrowing capacity.")
+    else:
+        ratio_excess = (total_debt / (ebitda * max_leverage))
+        print(f"The company is exceeding its borrowing capacity by {(ratio_excess - 1):.2%}.")
+    print("⚠️  Raw utilization score was negative. A value of 0 was used in the final OCCR Score to maintain consistency with bounded metrics.")
+    # Truncation notice (only if score < 0)
+    if utilization_score < 0:
+        print("⚠️  Raw score was negative. For consistency with bounded scores, 0 is used in the final OCCR Score.")
+    
+   #ratio interpretation
+    ratio = total_debt / (ebitda * max_leverage)
+    if ratio <= 1.0:
+        print(f"✅ Debt-to-capacity ratio: {ratio:.2f} (within borrowing capacity)")
+    elif ratio <= 1.3:
+        print(f"⚠️  Debt-to-capacity ratio: {ratio:.2f} (moderately overleveraged)")
+    else:
+        print(f"🚨 Debt-to-capacity ratio: {ratio:.2f} (severely overleveraged)")
+
+    #credit utilization score interpretation
+    if utilization_score > 0.8:
+        print("Interpretation: Very prudent use of debt and strong financial flexibility.")
+    elif utilization_score > 0.6:
+        print("Interpretation: Conservative leverage usage with low risk.")
+    elif utilization_score > 0.3:
+        print("Interpretation: Moderate leverage utilization; some financial pressure may exist.")
+    elif utilization_score >= 0.0:
+        print("Interpretation: High leverage utilization, limiting financial maneuverability.")
+    else:
+        print("Interpretation: Excessive leverage beyond safe thresholds, indicating critical financial stress.")
+
+
+    print(f"\nOn-Chain Transaction Score: {scti:.5f}")
+    print(f"The company’s recent operating cash flows reflect a transactional behavior score of {scti:.2%}, indicating {'strong inflow dominance' if scti > 0.6 else 'mixed' if scti > 0.4 else 'weakened cash dynamics'} over the past quarters.")
+    print(f"\nDetailed Table (Transaction Score):")
+    print(transaction_table.to_string(index=False))
+
+    print(f"\nNew Credit Score: {snci:.5f}")
+    print(f"In the recent period, {snci:.2%} of new credit events were flagged as unusually large and closely spaced — suggesting {'a potentially aggressive debt strategy' if snci > 0.6 else 'moderate borrowing activity' if snci > 0.3 else 'stable and controlled credit behavior'}.")
+    print(f"\nDetailed Table (New Credit Score - first 4 rows):")
+    print(snci_table.head(4).tail(4).to_string(index=False))
+
+    print(f"\nFinal OCCR Score: {occr_score:.5f}")
+    print("\nInterpretation Summary:")
+    print(interpret_occr_score(occr_score, hcs, current_score, utilization_score, scti, snci))
